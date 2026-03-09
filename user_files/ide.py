@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QFont, QColor, QSyntaxHighlighter, QTextCharFormat, QIcon, QKeySequence, QTextCursor
 from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QPropertyAnimation, QEasingCurve
 
 APP_CONFIG = os.path.join(os.getcwd(), 'data', 'mini_ide_config_improved.json')
 THEMES = {
@@ -345,9 +346,9 @@ class IDE(QMainWindow):
 
         self.plugin_manager = PluginManager(self)
         self.ai_manager = AiManager(self)
-        # start with sidebar hidden; only reveal after user opens a folder or
+        # start with side panel hidden; only reveal after user opens a folder or
         # presses the logo/button.  ignore stored preference on startup.
-        self.sidebar_visible = False
+        self.side_panel_visible = False
 
         self._setup_ui()
         self.plugin_manager.load_plugins()
@@ -358,23 +359,87 @@ class IDE(QMainWindow):
     def _setup_ui(self):
         self.setWindowTitle("Editor")
         self.resize(1200,800)
-        sidebar = QWidget(); sidebar.setFixedWidth(60)
-        sb_layout = QVBoxLayout(); sb_layout.setContentsMargins(0,0,0,0)
-        # use a clickable button instead of static label for the logo so we can
-        # toggle the sidebar by clicking it.
-        logo = QPushButton("A")
-        logo.setFlat(True)
-        logo.setStyleSheet("font-size:24px; font-weight:bold;")
-        logo.clicked.connect(self.toggle_sidebar)
-        logo.setCursor(Qt.PointingHandCursor)
-        sb_layout.addWidget(logo); sb_layout.addStretch(); sidebar.setLayout(sb_layout)
+        # activity bar (always visible) with logo and action buttons
+        activity_bar = QWidget(); activity_bar.setFixedWidth(50)
+        ab_layout = QVBoxLayout(); ab_layout.setContentsMargins(2,2,2,2)
+        ab_layout.setSpacing(4)
+        # logo / home button
+        self.logo = QPushButton("A")
+        self.logo.setFlat(True)
+        self.logo.setFixedSize(36,36)
+        self.logo.setStyleSheet("font-size:18px; font-weight:bold;")
+        self.logo.clicked.connect(self.toggle_sidebar)
+        self.logo.setCursor(Qt.PointingHandCursor)
+        ab_layout.addWidget(self.logo, 0, Qt.AlignHCenter)
+        # helper to create icon buttons
+        def make_btn(text, callback):
+            btn = QPushButton(text)
+            btn.setFlat(True)
+            btn.setFixedSize(36,36)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(callback)
+            return btn
+        self.btn_libs = make_btn("📦", self._show_lib_panel)
+        self.btn_ai = make_btn("🤖", lambda: self._show_ai_console())
+        self.btn_build = make_btn("🔨", lambda: self._run_build())
+        for b in (self.btn_libs, self.btn_ai, self.btn_build):
+            b.setVisible(False)
+            ab_layout.addWidget(b, 0, Qt.AlignHCenter)
+        ab_layout.addStretch(); activity_bar.setLayout(ab_layout)
+        self.activity_bar = activity_bar
 
+        # create terminal widgets early so pages can reference them
+        self.terminal = QListWidget()
+        self.terminal.setVisible(False)  # hide until there is output
+        self.terminal_input = QLineEdit(); self.terminal_input.returnPressed.connect(self.run_command)
+
+        # side_panel_stack will hold multiple pages (file browser, libs, AI, build)
+        self.side_panel_stack = QTabWidget()  # use a tab widget as stack; hide tabs
+        self.side_panel_stack.tabBar().setVisible(False)
+        # page 0: file explorer + terminal
+        tree_term_page = QWidget()
+        sp_layout = QVBoxLayout(); sp_layout.setContentsMargins(0,0,0,0)
         self.tree = QTreeView(); self.fsmodel = QFileSystemModel()
-        self.fsmodel.setRootPath(self.last_folder); self.tree.setModel(self.fsmodel)
-        self.tree.setRootIndex(self.fsmodel.index(self.last_folder)); self.tree.clicked.connect(self.on_tree_clicked)
-        # remember folder when changed
+        self.fsmodel.setRootPath(self.last_folder)
+        self.tree.setModel(self.fsmodel)
+        self.tree.setRootIndex(self.fsmodel.index(self.last_folder))
+        for col in range(1, self.fsmodel.columnCount()):
+            self.tree.setColumnHidden(col, True)
+        self.tree.clicked.connect(self.on_tree_clicked)
+        try:
+            accent = self.theme.get('accent') or self.theme.get('background')
+            self.tree.setStyleSheet(self.tree.styleSheet() +
+                f"QTreeView::item:selected {{ background:{accent}; }}")
+        except Exception:
+            pass
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_context_menu)
+        sp_layout.addWidget(self.tree)
+        term_widget = QWidget(); tbox = QVBoxLayout(); tbox.addWidget(self.terminal); tbox.addWidget(self.terminal_input)
+        term_widget.setLayout(tbox); sp_layout.addWidget(term_widget)
+        tree_term_page.setLayout(sp_layout)
+        self.side_panel_stack.addTab(tree_term_page, "Files")
+        # page 1: libraries panel (reuse LibraryManager widget class but embed)
+        lib_page = QWidget(); lib_layout = QVBoxLayout()
+        self.lib_panel = LibraryManager(self)  # QDialog subclass but behaves like widget
+        lib_layout.addWidget(self.lib_panel)
+        lib_page.setLayout(lib_layout)
+        self.side_panel_stack.addTab(lib_page, "Libs")
+        # page 2: AI panel
+        ai_page = QWidget(); ai_layout = QVBoxLayout()
+        self.ai_input = QTextEdit(); self.ai_input.setPlaceholderText('Savolingiz...')
+        ai_send = QPushButton('Yubor'); ai_send.clicked.connect(self._ai_send)
+        self.ai_output = QTextEdit(); self.ai_output.setReadOnly(True)
+        ai_layout.addWidget(self.ai_input); ai_layout.addWidget(ai_send); ai_layout.addWidget(self.ai_output)
+        ai_page.setLayout(ai_layout); self.side_panel_stack.addTab(ai_page, "AI")
+        # page 3: build output
+        build_page = QWidget(); build_layout = QVBoxLayout()
+        self.build_output = QTextEdit(); self.build_output.setReadOnly(True)
+        build_layout.addWidget(self.build_output)
+        build_page.setLayout(build_layout); self.side_panel_stack.addTab(build_page, "Build")
+        # wrap stack in container to allow hide/show
+        side_panel = QWidget(); panel_layout = QVBoxLayout(); panel_layout.setContentsMargins(0,0,0,0); panel_layout.addWidget(self.side_panel_stack); side_panel.setLayout(panel_layout)
+        self.side_panel = side_panel
 
         self.tabs = QTabWidget(); self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
@@ -385,18 +450,25 @@ class IDE(QMainWindow):
         self.terminal_input = QLineEdit(); self.terminal_input.returnPressed.connect(self.run_command)
 
         # store sidebar widget for toggling
-        self.sidebar = sidebar
-        left_split = QSplitter(Qt.Vertical); left_split.addWidget(self.tree); 
-        term_widget = QWidget(); tbox = QVBoxLayout(); tbox.addWidget(self.terminal); tbox.addWidget(self.terminal_input);
-        term_widget.setLayout(tbox); left_split.addWidget(term_widget)
-
-        main_split = QSplitter(Qt.Horizontal); main_split.addWidget(sidebar); main_split.addWidget(left_split); main_split.addWidget(self.tabs)
+        # activity_bar used to hold icons; keep reference for restyling
+        self.activity_bar = activity_bar
+        # replace old left_split with side_panel under control
+        main_split = QSplitter(Qt.Horizontal)
+        main_split.addWidget(self.activity_bar)
+        main_split.addWidget(self.side_panel)
+        main_split.addWidget(self.tabs)
         self.main_split = main_split
         self.setCentralWidget(main_split)
         # apply visibility state; start hidden regardless of config
-        self.sidebar.setVisible(self.sidebar_visible)
-        if not self.sidebar_visible:
-            self.main_split.setSizes([0,1,4])
+        self.side_panel_visible = False
+        if not self.side_panel_visible:
+            self.side_panel.setMaximumWidth(0)
+            self.side_panel.setVisible(False)
+            self.main_split.setSizes([1,0,5])  # keep activity bar visible
+        else:
+            self.side_panel.setMaximumWidth(200)
+            self.side_panel.setVisible(True)
+            self.main_split.setSizes([1,3,5])
 
         tb = QToolBar(); self.addToolBar(tb)
         tb.addAction(self._tr('Yangi'), self.new_file)
@@ -526,6 +598,10 @@ QPlainTextEdit {{ background:{bg}; color:{fg}; }}
     def open_file(self):
         path,_ = QFileDialog.getOpenFileName(self,self._tr('Ochish'), self.last_folder,'All Files (*)')
         if not path: return
+        self._open_file_path(path)
+
+    def _open_file_path(self, path):
+        # helper to load a file given an absolute path
         # remember folder
         self.last_folder = os.path.dirname(path)
         _set_config_value('folder', self.last_folder)
@@ -629,10 +705,16 @@ QPlainTextEdit {{ background:{bg}; color:{fg}; }}
 
 
     def on_tree_clicked(self,index):
-        if os.path.isfile(self.fsmodel.filePath(index)):
-            self.open_file()
+        """Open a file when it's clicked in the sidebar tree."""
+        path = self.fsmodel.filePath(index)
+        if os.path.isfile(path):
+            self._open_file_path(path)
 
-    def close_tab(self,idx): self.tabs.removeTab(idx)
+    def close_tab(self,idx):
+        self.tabs.removeTab(idx)
+        # ensure at least one tab exists to avoid errors elsewhere
+        if self.tabs.count() == 0:
+            self.new_file(welcome=True)
     def on_tab_changed(self,idx):
         w=self.tabs.widget(idx)
         ed=w.findChild(Editor)
@@ -659,6 +741,50 @@ QPlainTextEdit {{ background:{bg}; color:{fg}; }}
     def open_library_manager(self):
         dlg=LibraryManager(self); dlg.exec_()
 
+    def _show_lib_panel(self):
+        if not self.side_panel_visible:
+            # simply reveal side panel without prompting for folder
+            self.side_panel_visible = True
+            _set_config_value('sidebar_visible', True)
+            self.side_panel.setVisible(True)
+            self.side_panel.setMaximumWidth(200)
+            self.main_split.setSizes([1,3,5])
+        self.side_panel_stack.setCurrentIndex(1)
+
+    def _show_ai_console(self):
+        if not self.ai_manager.ensure_ready():
+            return
+        if not self.side_panel_visible:
+            self.side_panel_visible = True
+            _set_config_value('sidebar_visible', True)
+            self.side_panel.setVisible(True)
+            self.side_panel.setMaximumWidth(200)
+            self.main_split.setSizes([1,3,5])
+        self.side_panel_stack.setCurrentIndex(2)
+        # clear previous output
+        self.ai_output.clear()
+
+    def _ai_send(self):
+        prompt = self.ai_input.toPlainText().strip()
+        if not prompt:
+            return
+        answer = self.ai_manager.query(prompt)
+        self.ai_output.append(answer)
+
+    def _run_build(self):
+        if not self.side_panel_visible:
+            self.side_panel_visible = True
+            _set_config_value('sidebar_visible', True)
+            self.side_panel.setVisible(True)
+            self.side_panel.setMaximumWidth(200)
+            self.main_split.setSizes([1,3,5])
+        self.side_panel_stack.setCurrentIndex(3)
+        try:
+            res = subprocess.run([sys.executable, 'build.py'], capture_output=True, text=True)
+            self.build_output.setPlainText(res.stdout + ('\n' + res.stderr if res.stderr else ''))
+        except Exception as e:
+            self.build_output.setPlainText(f'Xato: {e}')
+
     def toggle_terminal(self):
         # simple show/hide with state tracking
         vis = self.terminal.isVisible()
@@ -681,13 +807,14 @@ QPlainTextEdit {{ background:{bg}; color:{fg}; }}
             self.fsmodel.setRootPath(folder)
             self.tree.setRootIndex(self.fsmodel.index(folder))
             _set_config_value('folder', folder)
-            # reveal sidebar automatically when a folder is selected
-            if not self.sidebar_visible:
-                self.sidebar_visible = True
+            # show the side panel with folder contents
+            if not self.side_panel_visible:
+                self.side_panel_visible = True
                 _set_config_value('sidebar_visible', True)
-                self.sidebar.setVisible(True)
+                self.side_panel.setVisible(True)
+                self.side_panel.setMaximumWidth(200)
                 self.main_split.setSizes([1,3,5])
-            # make sure toolbar button is visible once a folder exists
+                self.side_panel_stack.setCurrentIndex(0)
             if hasattr(self, 'act_open_folder'):
                 self.act_open_folder.setVisible(True)
 
@@ -706,19 +833,29 @@ QPlainTextEdit {{ background:{bg}; color:{fg}; }}
                 _set_config_value('folder', path)
 
     def _apply_sidebar_style(self):
-        # style sidebar using accent color with a little polish
+        # compute accent purely from the current theme so that switching
+        # themes always updates the sidebar colour accordingly.  if the
+        # theme provides an explicit `accent` we use it, otherwise fall back
+        # to the editor `background` colour (resulting in a unified look for
+        # simple themes).
         accent = None
         if isinstance(self.theme, dict):
-            accent = self.theme.get('accent') or self.theme.get('keyword')
+            accent = self.theme.get('accent')
         if not accent:
-            accent = '#444'  # fallback dark grey
-        # use a subtle gradient and a border to mimic a modern sidebar
-        self.sidebar.setStyleSheet(f"""
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                stop:0 {accent}, stop:1 {accent}CC);
-            border-right: 1px solid {self.theme.get('foreground', '#fff')};
-        """)
-        # also color the file tree similarly and ensure text remains readable
+            # if theme has no accent, use background; final fallback to blue
+            accent = self.theme.get('background', '#0057b7')
+        # apply accent to the activity bar and use theme background for panel
+        self.activity_bar.setStyleSheet(f"background:{accent};")
+        self.side_panel.setStyleSheet(f"background:{self.theme.get('background','#000')};")
+        # restyle logo and action buttons to match accent/foreground
+        try:
+            fg = self.theme.get('foreground','#fff')
+            self.logo.setStyleSheet(f"font-size:18px; font-weight:bold; background:{accent}; color:{fg}")
+            for b in (self.btn_libs, self.btn_ai, self.btn_build):
+                b.setStyleSheet(f"font-size:16px; background:{accent}; color:{fg}")
+        except Exception:
+            pass
+        # also colour the file tree; ensure selection is visible against editor
         try:
             fg = self.theme.get('foreground', '#fff')
             self.tree.setStyleSheet(f"""
@@ -730,14 +867,34 @@ QPlainTextEdit {{ background:{bg}; color:{fg}; }}
             pass
 
     def toggle_sidebar(self):
-        self.sidebar_visible = not self.sidebar_visible
-        _set_config_value('sidebar_visible', self.sidebar_visible)
-        self.sidebar.setVisible(self.sidebar_visible)
-        if not self.sidebar_visible:
-            # collapse to zero width
-            self.main_split.setSizes([0,1,4])
-        else:
-            self.main_split.setSizes([1,3,5])
+        # if folder not selected, open it
+        if not self.last_folder or not os.path.isdir(self.last_folder):
+            self.open_folder()
+            return
+        # animate side_panel instead of activity_bar
+        target = 200 if not self.side_panel_visible else 0
+        anim = QPropertyAnimation(self.side_panel, b"maximumWidth")
+        anim.setDuration(200)
+        anim.setStartValue(self.side_panel.width())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.InOutQuad)
+        anim.start()
+        self.side_panel_visible = not self.side_panel_visible
+        _set_config_value('sidebar_visible', self.side_panel_visible)
+        def on_finished():
+            if not self.side_panel_visible:
+                self.side_panel.setVisible(False)
+                self.main_split.setSizes([1,0,5])
+            else:
+                self.side_panel.setVisible(True)
+                self.main_split.setSizes([1,3,5])
+        anim.finished.connect(on_finished)
+        # toggle action buttons visibility
+        for b in (self.btn_libs, self.btn_ai, self.btn_build):
+            b.setVisible(self.side_panel_visible)
+        # when opening panel normally, switch back to files page
+        if self.side_panel_visible:
+            self.side_panel_stack.setCurrentIndex(0)
 
     def open_admin_settings(self):
         # reuse auth module's settings dialog

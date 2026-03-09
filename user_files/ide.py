@@ -9,9 +9,35 @@ from PyQt5.QtCore import Qt
 
 APP_CONFIG = os.path.join(os.getcwd(), 'data', 'mini_ide_config_improved.json')
 THEMES = {
-    'Light': {'background': '#fff', 'foreground': '#222', 'keyword': '#0057b7', 'string': '#008000', 'comment': '#888'},
-    'Dark': {'background': '#23272e', 'foreground': '#e6e6e6', 'keyword': '#569CD6', 'string': '#98C379', 'comment': '#6A9955'},
-    'Monokai': {'background': '#272822', 'foreground': '#f8f8f2', 'keyword': '#f92672', 'string': '#e6db74', 'comment': '#75715e'},
+    # editor/background color plus UI secondary color and an accent for the
+    # sidebar/file tree to mimic VSCode-style theme switching.
+    'Light': {
+        'background': '#ffffff',
+        'secondary': '#f0f0f0',
+        'foreground': '#222222',
+        'keyword': '#0057b7',
+        'string': '#008000',
+        'comment': '#888888',
+        'accent': '#0057b7'
+    },
+    'Dark': {
+        'background': '#23272e',
+        'secondary': '#1e1e1e',
+        'foreground': '#e6e6e6',
+        'keyword': '#569CD6',
+        'string': '#98C379',
+        'comment': '#6A9955',
+        'accent': '#569CD6'
+    },
+    'Monokai': {
+        'background': '#272822',
+        'secondary': '#3e3d32',
+        'foreground': '#f8f8f2',
+        'keyword': '#f92672',
+        'string': '#e6db74',
+        'comment': '#75715e',
+        'accent': '#f92672'
+    },
 }
 DEFAULT_THEME = 'Dark'
 PY_KEYWORDS = [
@@ -319,7 +345,9 @@ class IDE(QMainWindow):
 
         self.plugin_manager = PluginManager(self)
         self.ai_manager = AiManager(self)
-        self.sidebar_visible = _get_config_value('sidebar_visible', True)
+        # start with sidebar hidden; only reveal after user opens a folder or
+        # presses the logo/button.  ignore stored preference on startup.
+        self.sidebar_visible = False
 
         self._setup_ui()
         self.plugin_manager.load_plugins()
@@ -332,7 +360,13 @@ class IDE(QMainWindow):
         self.resize(1200,800)
         sidebar = QWidget(); sidebar.setFixedWidth(60)
         sb_layout = QVBoxLayout(); sb_layout.setContentsMargins(0,0,0,0)
-        logo = QLabel("A"); logo.setAlignment(Qt.AlignCenter)
+        # use a clickable button instead of static label for the logo so we can
+        # toggle the sidebar by clicking it.
+        logo = QPushButton("A")
+        logo.setFlat(True)
+        logo.setStyleSheet("font-size:24px; font-weight:bold;")
+        logo.clicked.connect(self.toggle_sidebar)
+        logo.setCursor(Qt.PointingHandCursor)
         sb_layout.addWidget(logo); sb_layout.addStretch(); sidebar.setLayout(sb_layout)
 
         self.tree = QTreeView(); self.fsmodel = QFileSystemModel()
@@ -359,7 +393,7 @@ class IDE(QMainWindow):
         main_split = QSplitter(Qt.Horizontal); main_split.addWidget(sidebar); main_split.addWidget(left_split); main_split.addWidget(self.tabs)
         self.main_split = main_split
         self.setCentralWidget(main_split)
-        # apply saved visibility state
+        # apply visibility state; start hidden regardless of config
         self.sidebar.setVisible(self.sidebar_visible)
         if not self.sidebar_visible:
             self.main_split.setSizes([0,1,4])
@@ -382,6 +416,8 @@ class IDE(QMainWindow):
         tb.addAction('Qidiruv', self.open_search)
         tb.addAction(self._tr('Sozlamalar'), self.open_settings)
         tb.addAction('Toggle sidebar', self.toggle_sidebar)
+        # add explicit button to toggle terminal visibility
+        tb.addAction('Toggle terminal', self.toggle_terminal)
         if self.is_admin:
             tb.addAction('Kutubxonalar', self.open_library_manager)
             tb.addAction('GitHub’dan yuklash', self.github_download)
@@ -407,10 +443,28 @@ class IDE(QMainWindow):
 
     def _apply_theme_to_ui(self):
         # apply stylesheet to main window and set default fg/bg on root
-        sec = self.theme.get('secondary', '')
+        # use explicit secondary color if provided, otherwise fall back to
+        # the standard background value so that existing themes continue to
+        # work.  Many widget types are styled here so that changing the theme
+        # affects the entire interface, not just editors and dialogs.
+        sec = self.theme.get('secondary', self.theme.get('background', ''))
+        bg = self.theme.get('background', sec)
         fg = self.theme.get('foreground', '#000')
+        # build a comprehensive stylesheet; order matters because later rules
+        # override earlier ones if they overlap.  the intent is to make the
+        # *editor content* use `background` while the rest of the UI uses
+        # `secondary` so that panels/toolbars/menus are distinct like in VSCode.
+        style = f"""
+QMainWindow {{ background:{sec}; color:{fg}; }}
+QToolBar, QMenuBar, QMenu, QTabBar, QTabWidget, QDockWidget {{ background:{sec}; color:{fg}; }}
+QWidget {{ background:{sec}; color:{fg}; }}
+QLabel, QMenu, QToolButton, QPushButton {{ color:{fg}; }}
+QLineEdit, QComboBox, QListWidget, QTreeView, QTableView, QSpinBox, QTextEdit, QPlainTextEdit {{
+    background:{bg}; color:{fg}; }}
+QPlainTextEdit {{ background:{bg}; color:{fg}; }}
+"""
         try:
-            self.setStyleSheet(f"background:{sec}; color:{fg};")
+            self.setStyleSheet(style)
         except Exception:
             pass
         # update toolbar button texts if language changed
@@ -420,6 +474,13 @@ class IDE(QMainWindow):
                 action.setText(self._tr(txt))
         # reapply sidebar style as colours may rely on theme
         self._apply_sidebar_style()
+        # propagate colours to any dialog-like widgets created by the global app
+        try:
+            app = QApplication.instance()
+            if app:
+                app.setStyleSheet(f"QMessageBox, QFileDialog, QInputDialog {{ background:{sec}; color:{fg}; }}")
+        except Exception:
+            pass
         # update all open editors with new theme
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
@@ -581,6 +642,7 @@ class IDE(QMainWindow):
     def run_command(self):
         cmd=self.terminal_input.text()
         if not cmd: return
+        # show terminal when executing anything
         if not self.terminal.isVisible():
             self.terminal.setVisible(True)
         try:
@@ -591,9 +653,26 @@ class IDE(QMainWindow):
         except Exception as e:
             self.terminal.addItem(str(e))
         self.terminal_input.clear()
+        # hide terminal again if it has no meaningful content
+        self.update_terminal_visibility()
 
     def open_library_manager(self):
         dlg=LibraryManager(self); dlg.exec_()
+
+    def toggle_terminal(self):
+        # simple show/hide with state tracking
+        vis = self.terminal.isVisible()
+        self.terminal.setVisible(not vis)
+        if not vis and self.terminal.count() == 0:
+            # if showing empty terminal, keep hidden until something added
+            self.terminal.setVisible(False)
+
+    def update_terminal_visibility(self):
+        # ensure terminal visible only when it has at least one item
+        if self.terminal.count() == 0:
+            self.terminal.setVisible(False)
+        else:
+            self.terminal.setVisible(True)
 
     def open_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Folder ochish', self.last_folder or os.getcwd())
@@ -602,6 +681,12 @@ class IDE(QMainWindow):
             self.fsmodel.setRootPath(folder)
             self.tree.setRootIndex(self.fsmodel.index(folder))
             _set_config_value('folder', folder)
+            # reveal sidebar automatically when a folder is selected
+            if not self.sidebar_visible:
+                self.sidebar_visible = True
+                _set_config_value('sidebar_visible', True)
+                self.sidebar.setVisible(True)
+                self.main_split.setSizes([1,3,5])
             # make sure toolbar button is visible once a folder exists
             if hasattr(self, 'act_open_folder'):
                 self.act_open_folder.setVisible(True)
@@ -621,17 +706,26 @@ class IDE(QMainWindow):
                 _set_config_value('folder', path)
 
     def _apply_sidebar_style(self):
-        # style sidebar based on theme keyword color (acts like accent)
+        # style sidebar using accent color with a little polish
         accent = None
         if isinstance(self.theme, dict):
             accent = self.theme.get('accent') or self.theme.get('keyword')
         if not accent:
             accent = '#444'  # fallback dark grey
-        self.sidebar.setStyleSheet(f"background:{accent};")
-        # also color the file tree similarly
+        # use a subtle gradient and a border to mimic a modern sidebar
+        self.sidebar.setStyleSheet(f"""
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 {accent}, stop:1 {accent}CC);
+            border-right: 1px solid {self.theme.get('foreground', '#fff')};
+        """)
+        # also color the file tree similarly and ensure text remains readable
         try:
             fg = self.theme.get('foreground', '#fff')
-            self.tree.setStyleSheet(f"background:{accent}; color:{fg};")
+            self.tree.setStyleSheet(f"""
+                background:{accent};
+                color:{fg};
+                selection-background-color:{self.theme.get('background','')};
+            """)
         except Exception:
             pass
 
